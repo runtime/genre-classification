@@ -116,5 +116,3 @@ Openai api version 0.38 is depreciated.
 #### requirements
 openai secret key
 
-#### Assumption
-After 
