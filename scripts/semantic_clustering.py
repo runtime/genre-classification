@@ -4,6 +4,8 @@ import psycopg2
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 import logging
 import time
 import random
@@ -36,39 +38,27 @@ conn_processed = psycopg2.connect(
 
 logging.info('Successfully connected to both databases!')
 
-
 def fetch_data():
     """Fetch descriptions and genres from the original database."""
     logging.info('Fetching data from original database...')
     cursor = conn_original.cursor()
     cursor.execute("SELECT id, description, genre FROM media_items;")
     data = cursor.fetchall()
+    # inspect the data to ensure we're getting a tuple
+    logging.info(f"First 3 rows of data: {data[:3]}")
     cursor.close()
     logging.info(f"Fetched {len(data)} records.")
     return data
 
-
-# def vectorize_descriptions(descriptions):
-#     """Generate embeddings for descriptions using OpenAI."""
-#     logging.info('Vectorizing descriptions...')
-#     embeddings = []
-#
-#     # Use the 0.38 version of OpenAI API method for embedding
-#     for desc in descriptions:
-#         response = openai.Embedding.create(
-#             model="text-embedding-ada-002",
-#             input=desc
-#         )
-#         vector = response['data'][0]['embedding']
-#         embeddings.append(vector)
-#
-#     logging.info(f"Generated {len(embeddings)} embeddings.")
-#     return np.array(embeddings)
-def vectorize_descriptions(descriptions, batch_size=10):
-    logging.info('Vectorizing descriptions...')
+# vectorize the merged data using openai - batching.. running on a t3.micro.
+# batching code by gpt4o ;)
+def vectorize_data(data, batch_size=10):
+    """ Vectorize the merged data using OpenAI's API. """
+    factors = [f"{description}, Genre: {genre}" for _, description, genre in data]  # Combine description and genre
+    logging.info('Vectorizing merged data...')
     embeddings = []
-    for i in range(0, len(descriptions), batch_size):
-        batch = descriptions[i:i + batch_size]
+    for i in range(0, len(factors), batch_size):
+        batch = factors[i:i + batch_size]
         try:
             response = openai.Embedding.create(
                 input=batch,
@@ -81,23 +71,28 @@ def vectorize_descriptions(descriptions, batch_size=10):
             raise
     return np.array(embeddings)
 
-def retry_with_backoff(func, *args, retries=5, backoff_factor=1.5, **kwargs):
-    for attempt in range(retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            wait_time = backoff_factor * (2 ** attempt) + random.uniform(0, 1)
-            logging.warning(f"Retrying in {wait_time:.2f} seconds... (Attempt {attempt + 1}/{retries})")
-            time.sleep(wait_time)
-    raise RuntimeError(f"Failed after {retries} retries.")
 
-# Use it for vectorization
-def vectorize_batch_with_retry(batch):
-    return retry_with_backoff(
-        openai.Embedding.create,
-        input=batch,
-        model="text-embedding-ada-002"
-    )
+# scale & fit transform the embeddings
+def scale_embeddings(embeddings):
+    """Standardize the embeddings."""
+    scaler = StandardScaler()
+    scaled_embeddings = scaler.fit_transform(embeddings)
+    return scaled_embeddings
+
+# apply principal component analysis for dimensionality reduction
+def apply_pca(embeddings, n_components=2):
+    """Apply PCA for dimensionality reduction. override n in main"""
+    # instantiate
+    pca = PCA(n_components=n_components)
+    # fit transform embeddings & return
+    reduced_embeddings = pca.fit_transform(embeddings)
+    # stash variance ratio
+    info = f"PCA applied. Explained variance ratio: {pca.explained_variance_ratio_}"
+    # log it
+    logging.info(info)
+    # review the first 5 rows of list data
+    logging.info(f"First 5 rows of reduced embeddings: {reduced_embeddings[:5]}")
+    return reduced_embeddings
 
 def cluster_data(vectors, n_clusters=5):
     """Cluster the embeddings using KMeans."""
@@ -106,65 +101,103 @@ def cluster_data(vectors, n_clusters=5):
     labels = kmeans.fit_predict(vectors)
     score = silhouette_score(vectors, labels)
     logging.info(f"Silhouette Score: {score}")
-    return labels, kmeans.cluster_centers_
+    return labels, kmeans.cluster_centers_, score
 
 
-def save_clusters_to_db(data, labels, cluster_centers):
+def save_clusters_to_db(data, labels, original_embeddings, reduced_embeddings, cluster_centers):
     """Save clustered data and centroids to the processed database."""
     logging.info('Saving clustered data to processed database...')
-    cursor = conn_processed.cursor()
+    logging.info(f"Data length: {len(data)}")
+    logging.info(f"Labels length: {len(labels)}")
+    logging.info(f"Original embeddings length: {len(original_embeddings)}")
+    logging.info(f"Reduced embeddings length: {len(reduced_embeddings)}")
 
-    # Create tables if they don't exist
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS clustered_media_items (
-            id SERIAL PRIMARY KEY,
-            original_id INT,
-            description TEXT,
-            genre TEXT,
-            cluster_label INT,
-            embedding VECTOR(1536)
-        );
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS clustered_centroids (
-            id SERIAL PRIMARY KEY,
-            centroid VECTOR(1536)
-        );
-    """)
-
-    # Insert clustered data
-    for (original_id, description, genre), label, embedding in zip(data, labels, cluster_centers):
-        cursor.execute(
-            """
-            INSERT INTO clustered_media_items (original_id, description, genre, cluster_label, embedding)
-            VALUES (%s, %s, %s, %s, %s);
-            """,
-            (original_id, description, genre, int(label), embedding.tolist())
+    try:
+        conn_processed = psycopg2.connect(
+            dbname=os.getenv('DB2_NAME'),
+            user=os.getenv('DB2_USER'),
+            password=os.getenv('DB2_PASS'),
+            host=os.getenv('DB2_HOST'),
+            port=int(os.getenv('DB2_PORT'))
         )
+        cursor = conn_processed.cursor()
 
-    # Insert cluster centroids
-    for center in cluster_centers:
-        cursor.execute(
-            """
-            INSERT INTO clustered_centroids (centroid)
-            VALUES (%s);
-            """,
-            (center.tolist(),)
-        )
+        # Create tables if they don't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clustered_media_items (
+                id SERIAL PRIMARY KEY,
+                original_id INT,
+                description TEXT,
+                genre TEXT,
+                cluster_label INT,
+                embedding VECTOR(1536),
+                reduced_embedding VECTOR(2)
+            );
+        """)
 
-    conn_processed.commit()
-    logging.info("Clustered data and centroids saved successfully.")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clustered_centroids (
+                id SERIAL PRIMARY KEY,
+                centroid VECTOR(2)
+            );
+        """)
 
+        # Insert clustered data
+        for row, label, embedding, reduced_embedding in zip(data, labels, original_embeddings, reduced_embeddings):
+            logging.info(f"Data: {data[:5]}")
+            logging.info(f"Labels: {labels[:5]}")
+            logging.info(f"Original embeddings: {original_embeddings[:5]}")
+            logging.info(f"Reduced embeddings: {reduced_embeddings[:5]}")
+            try:
+                original_id, description, genre = row
+                cursor.execute(
+                    """
+                    INSERT INTO clustered_media_items (original_id, description, genre, cluster_label, embedding, reduced_embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                    """,
+                    (original_id, description, genre, int(label), embedding.tolist(), reduced_embedding.tolist())
+                )
+            except Exception as e:
+                logging.error(f"Failed to insert record: {row}. Error: {e}")
+                continue
+
+        # Insert cluster centroids
+        for center in cluster_centers:
+            cursor.execute(
+                """
+                INSERT INTO clustered_centroids (centroid)
+                VALUES (%s);
+                """,
+                (center.tolist(),)
+            )
+
+        # Commit the transaction
+        conn_processed.commit()
+        logging.info("Clustered data and centroids saved successfully.")
+
+    except psycopg2.Error as db_error:
+        logging.error(f"An error occurred while saving data: {db_error}")
+        conn_processed.rollback()
+
+    finally:
+        cursor.close()
+        conn_processed.close()
 
 def main():
     """Main execution pipeline."""
     try:
+        # 1 get data
         data = fetch_data()
-        descriptions = [row[1] for row in data]  # Extract descriptions
-        vectors = vectorize_descriptions(descriptions)
-        labels, cluster_centers = cluster_data(vectors)
-        save_clusters_to_db(data, labels, cluster_centers)
+        # 3 embed data
+        original_embeddings = vectorize_data(data)
+        # 4 scale data
+        scaled_embeddings = scale_embeddings(original_embeddings) # dont use in visualization, but needed when we have small data sets
+        # 5 apply PCA
+        reduced_embeddings = apply_pca(scaled_embeddings, n_components=2)
+        # 6 use Kmeans to cluster data with reduced embeddings
+        labels, cluster_centers, score = cluster_data(reduced_embeddings) # adding score here as per suggestion
+        # 7 save into the database, raw data, labels,  embeddings (original bc they need to be 2d) and cluster centers for graphing
+        save_clusters_to_db(data, labels, original_embeddings, reduced_embeddings, cluster_centers)
     except Exception as e:
         logging.error(f"An error occurred: {e}")
     finally:
