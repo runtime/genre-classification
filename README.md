@@ -87,6 +87,11 @@ To add additional dependencies, for example other CDK libraries, just add
 them to your `setup.py` file and rerun the `pip install -r requirements.txt`
 command.
 
+#### note about lambda handler
+the lambda handler here is unused due to the inability to import psycopg2 using layers or requirements.txt within the folder. 
+i have left the folder here so that I can continue to work on lambdas that use psycopg2
+
+
 ## Useful commands
 
  * `cdk ls`          list all stacks in the app

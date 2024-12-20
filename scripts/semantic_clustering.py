@@ -10,6 +10,10 @@ import logging
 import time
 import random
 
+from collections import Counter
+import itertools
+
+
 # Set OpenAI API Key
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
@@ -49,6 +53,39 @@ def fetch_data():
     cursor.close()
     logging.info(f"Fetched {len(data)} records.")
     return data
+
+# extract the keywords by cluster dynamically
+
+def extract_keywords_by_cluster(data, labels):
+    """Extract the most common genre keywords for each cluster."""
+    logging.info("Extracting keywords for each cluster...")
+    cluster_keywords = {}
+
+    # Group genres by cluster
+    genres_by_cluster = {}
+    for row, label in zip(data, labels):
+        _, _, genre = row  # Extract genres from data _, ignores the column
+        if label not in genres_by_cluster:
+            genres_by_cluster[label] = [] # create a new array with this label
+        genres_by_cluster[label].append(genre) #append the genre
+
+    # Process keywords for each cluster
+    for cluster_label, genres in genres_by_cluster.items():
+        # Split comma-separated genres into individual words
+        all_keywords = list(itertools.chain(*[g.split(", ") for g in genres]))
+
+        # Count most common keywords
+        keyword_counts = Counter(all_keywords)
+        top_keywords = ", ".join([f"{word} ({count})" for word, count in keyword_counts.most_common(3)])
+
+        cluster_keywords[cluster_label] = top_keywords
+        logging.info(f"Cluster {cluster_label}: {top_keywords}")
+
+    return cluster_keywords
+
+
+
+
 
 # vectorize the merged data using openai - batching.. running on a t3.micro.
 # batching code by gpt4o ;)
@@ -191,12 +228,17 @@ def main():
         # 3 embed data
         original_embeddings = vectorize_data(data)
         # 4 scale data
-        scaled_embeddings = scale_embeddings(original_embeddings) # dont use in visualization, but needed when we have small data sets
+        scaled_embeddings = scale_embeddings(original_embeddings)
         # 5 apply PCA
         reduced_embeddings = apply_pca(scaled_embeddings, n_components=2)
         # 6 use Kmeans to cluster data with reduced embeddings
-        labels, cluster_centers, score = cluster_data(reduced_embeddings) # adding score here as per suggestion
-        # 7 save into the database, raw data, labels,  embeddings (original bc they need to be 2d) and cluster centers for graphing
+        labels, cluster_centers, score = cluster_data(reduced_embeddings)
+        # 7 extract keywords per cluster
+        cluster_keywords = extract_keywords_by_cluster(data, labels)
+        # Log keywords for review
+        for label, keywords in cluster_keywords.items():
+            logging.info(f"Cluster {label}: {keywords}")
+        # 8 save into the database
         save_clusters_to_db(data, labels, original_embeddings, reduced_embeddings, cluster_centers)
     except Exception as e:
         logging.error(f"An error occurred: {e}")
